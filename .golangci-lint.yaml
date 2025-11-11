@@ -1,0 +1,99 @@
+version: "2"
+
+run:
+  timeout: 3m
+  concurrency: 4
+  # Можно раскомментировать для проверки только новых изменений
+  new: true
+
+# Основные линтеры
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck         # включает: gosimple, tenv, exportloopref
+    - unused
+    - ineffassign
+    - misspell
+    - unconvert
+    - goconst
+    - gocritic
+    - nakedret
+    - prealloc
+    - dogsled
+    - funlen
+    - whitespace
+  disable:
+    - lll                 # слишком строгий по длине строк
+    - gocyclo             # сложность — можно игнорировать
+    - godot               # комментарии не обязаны заканчиваться точкой
+    # - gosec             # можно включить, если нужна security-проверка
+    - depguard
+    - revive
+  exclusions:
+    paths:
+      - test/*
+# Настройки линтеров
+linters-settings:
+  govet:
+    # Включаем проверку затенения переменных
+    enable:
+      - shadow
+  gocritic:
+    enabled-tags:
+      - performance
+      - style
+    disabled-checks:
+      - hugeParam
+      - rangeValCopy
+  funlen:
+    lines: 60
+    statements: 40
+  whitespace:
+    multi-if: true
+    multi-func: true
+  dogsled:
+    max-blank-identifiers: 2
+  revive:
+    # Можно раскомментировать для кастомной конфигурации
+    # config-path: .revive.toml
+    rules:
+      - name: package-comments
+        disabled: true
+      - name: exported
+        disabled: true
+      # Оставляем полезные
+      - name: unused-parameter
+      - name: empty-block
+      - name: error-return
+      - name: var-naming
+      - name: context-as-argument
+      - name: indent-error-flow
+
+# Форматтеры — вынесены в отдельную секцию
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      # Группировка импортов: std → third-party → local
+      local-prefixes: github.com/shuldan/queue
+
+# Проверка кода
+issues:
+  # Исключаем ложные срабатывания
+  exclude:
+    - "weak cryptographic primitive"
+    - "G101" # hardcoded credentials — допустимо в тестах
+  # Сортировка: по пути файла
+  sort-by: path
+  # Максимум проблем
+  max-per-linter: 0
+  max-same-issues: 0
+
+# Формат вывода
+output:
+  format: tab

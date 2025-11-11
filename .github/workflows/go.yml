@@ -1,0 +1,74 @@
+name: Go CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  lint-and-test:
+    name: Lint, Format & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Install tools
+        run: |
+          go install golang.org/x/tools/cmd/goimports@latest
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.4.0
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Verify dependencies
+        run: |
+          go mod tidy
+          go mod verify
+
+      - name: Check code formatting (gofmt + goimports)
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "❌ Unformatted files (gofmt):"
+            echo "$unformatted"
+            exit 1
+          fi
+          unimported=$(goimports -local github.com/shuldan/queue -l .)
+          if [ -n "$unimported" ]; then
+            echo "❌ Unformatted imports (goimports):"
+            echo "$unimported"
+            exit 1
+          fi
+
+      - name: Run linter
+        run: $(go env GOPATH)/bin/golangci-lint run --config .golangci-lint.yaml
+
+      - name: Run security scan (gosec)
+        run: gosec -exclude-dir=test ./...
+
+      - name: Run tests with coverage
+        run: go test -race -count=1 -timeout=30s -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Display coverage
+        run: |
+          go tool cover -func=coverage.out
+          COVERAGE=$(go tool cover -func=coverage.out | awk '/total/ {print $3}' | sed 's/%//')
+          echo "Total coverage: ${COVERAGE}%"
+          # Требуем минимум 70% покрытия
+          if (( $(echo "$COVERAGE < 70.0" | bc -l) )); then
+            echo "❌ Coverage ($COVERAGE%) is below 70%"
+            exit 1
+          fi
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+        if: github.ref == 'refs/heads/main'
