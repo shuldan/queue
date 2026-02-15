@@ -62,7 +62,6 @@ func (b *mockBroker) Consume(
 		return ErrBrokerClosed
 	}
 	ch := b.getOrCreateChan(topic)
-
 	goroutineDone := make(chan struct{})
 	b.wg.Add(1)
 	go func() {
@@ -82,7 +81,6 @@ func (b *mockBroker) Consume(
 			}
 		}
 	}()
-
 	select {
 	case <-ctx.Done():
 		<-goroutineDone
@@ -118,6 +116,22 @@ func (b *mockBroker) Close() error {
 	b.mu.Unlock()
 	return nil
 }
+
+type failProduceBroker struct {
+	produceErr error
+}
+
+func (b *failProduceBroker) Produce(_ context.Context, _ string, _ []byte) error {
+	return b.produceErr
+}
+
+func (b *failProduceBroker) Consume(ctx context.Context, _ string, _ func([]byte) error) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (b *failProduceBroker) Ping(_ context.Context) error { return nil }
+func (b *failProduceBroker) Close() error                 { return nil }
 
 type testJob struct {
 	Msg string `json:"msg"`
@@ -253,7 +267,6 @@ func TestQueue_ProduceConsume_EndToEnd(t *testing.T) {
 	q, _ := newQueue(t, WithWorkerCount(1), WithBackoff(NoBackoff{}))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	var got atomic.Value
 	doneCh := make(chan struct{})
 	go func() {
@@ -264,7 +277,6 @@ func TestQueue_ProduceConsume_EndToEnd(t *testing.T) {
 		})
 		close(doneCh)
 	}()
-
 	time.Sleep(50 * time.Millisecond)
 	if err := q.Produce(ctx, &testJob{Msg: "e2e"}); err != nil {
 		t.Fatalf("produce error: %v", err)
@@ -327,7 +339,6 @@ func TestQueue_Use_Middleware(t *testing.T) {
 	q, _ := newQueue(t, WithWorkerCount(1), WithBackoff(NoBackoff{}))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	var mwCalled atomic.Bool
 	q.Use(func(next func(context.Context, *testJob) error) func(context.Context, *testJob) error {
 		return func(ctx context.Context, j *testJob) error {
@@ -335,7 +346,6 @@ func TestQueue_Use_Middleware(t *testing.T) {
 			return next(ctx, j)
 		}
 	})
-
 	doneCh := make(chan struct{})
 	go func() {
 		_ = q.Consume(ctx, func(_ context.Context, _ *testJob) error {
@@ -344,7 +354,6 @@ func TestQueue_Use_Middleware(t *testing.T) {
 		})
 		close(doneCh)
 	}()
-
 	time.Sleep(50 * time.Millisecond)
 	_ = q.Produce(ctx, &testJob{Msg: "mw"})
 	<-doneCh
@@ -364,13 +373,10 @@ func TestQueue_Ping(t *testing.T) {
 func TestQueue_RetryOnError(t *testing.T) {
 	t.Parallel()
 	q, _ := newQueue(t,
-		WithWorkerCount(1),
-		WithMaxRetries(2),
-		WithBackoff(NoBackoff{}),
+		WithWorkerCount(1), WithMaxRetries(2), WithBackoff(NoBackoff{}),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
 	var attempts atomic.Int32
 	doneCh := make(chan struct{})
 	go func() {
@@ -380,16 +386,13 @@ func TestQueue_RetryOnError(t *testing.T) {
 		})
 		close(doneCh)
 	}()
-
 	time.Sleep(50 * time.Millisecond)
 	_ = q.Produce(ctx, &testJob{Msg: "retry"})
 	time.Sleep(300 * time.Millisecond)
 	cancel()
 	<-doneCh
-
-	got := int(attempts.Load())
-	if got != 3 {
-		t.Errorf("expected 3 attempts (1 + 2 retries), got %d", got)
+	if got := int(attempts.Load()); got != 3 {
+		t.Errorf("expected 3 attempts, got %d", got)
 	}
 }
 
@@ -397,18 +400,14 @@ func TestQueue_DLQ_SendsAfterRetries(t *testing.T) {
 	t.Parallel()
 	b := newMockBroker()
 	q, err := New[*testJob](b,
-		WithWorkerCount(1),
-		WithMaxRetries(1),
-		WithBackoff(NoBackoff{}),
-		WithDLQ(true),
+		WithWorkerCount(1), WithMaxRetries(1),
+		WithBackoff(NoBackoff{}), WithDLQ(true),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
 	var attempts atomic.Int32
 	doneCh := make(chan struct{})
 	go func() {
@@ -418,7 +417,6 @@ func TestQueue_DLQ_SendsAfterRetries(t *testing.T) {
 		})
 		close(doneCh)
 	}()
-
 	time.Sleep(50 * time.Millisecond)
 	_ = q.Produce(ctx, &testJob{Msg: "dlq"})
 	time.Sleep(300 * time.Millisecond)
@@ -426,7 +424,6 @@ func TestQueue_DLQ_SendsAfterRetries(t *testing.T) {
 	<-doneCh
 	q.Close()
 	b.Close()
-
 	if attempts.Load() < 2 {
 		t.Errorf("expected at least 2 attempts, got %d", attempts.Load())
 	}
@@ -435,18 +432,11 @@ func TestQueue_DLQ_SendsAfterRetries(t *testing.T) {
 func TestQueue_PanicInHandler(t *testing.T) {
 	t.Parallel()
 	b := newMockBroker()
-	q, err := New[*testJob](b,
-		WithWorkerCount(1),
-		WithMaxRetries(0),
-		WithBackoff(NoBackoff{}),
+	q, _ := New[*testJob](b,
+		WithWorkerCount(1), WithMaxRetries(0), WithBackoff(NoBackoff{}),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
 	doneCh := make(chan struct{})
 	go func() {
 		_ = q.Consume(ctx, func(_ context.Context, _ *testJob) error {
@@ -454,7 +444,6 @@ func TestQueue_PanicInHandler(t *testing.T) {
 		})
 		close(doneCh)
 	}()
-
 	time.Sleep(50 * time.Millisecond)
 	_ = q.Produce(ctx, &testJob{Msg: "panic"})
 	time.Sleep(200 * time.Millisecond)
@@ -479,6 +468,14 @@ func TestQueue_WaitBackoff_ZeroDelay(t *testing.T) {
 	q, _ := newQueue(t, WithBackoff(NoBackoff{}))
 	if !q.waitBackoff(context.Background(), 0) {
 		t.Error("expected true for zero delay")
+	}
+}
+
+func TestQueue_WaitBackoff_TimerFires(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithBackoff(FixedBackoff{Duration: time.Millisecond}))
+	if !q.waitBackoff(context.Background(), 0) {
+		t.Error("expected true when timer fires")
 	}
 }
 
@@ -549,11 +546,9 @@ func TestQueue_StartWorkers_ProcessMessages(t *testing.T) {
 	t.Parallel()
 	q, _ := newQueue(t, WithWorkerCount(2), WithBackoff(NoBackoff{}))
 	jobs := make(chan []byte, 2)
-
 	env := newEnvelope(q.Topic(), mustMarshalJob(&testJob{Msg: "w"}), nil)
 	data, _ := marshalEnvelope(env)
 	jobs <- data
-
 	var called atomic.Bool
 	wg := q.startWorkers(context.Background(), jobs,
 		func(_ context.Context, _ *testJob) error {
@@ -646,7 +641,6 @@ func TestQueue_ExecuteWithRetries_FailAndDLQ(t *testing.T) {
 		WithMaxRetries(1), WithBackoff(NoBackoff{}), WithDLQ(true),
 	)
 	defer func() { q.Close(); b.Close() }()
-
 	env := newEnvelope(q.Topic(), nil, nil)
 	var mu sync.Mutex
 	var count int
@@ -661,6 +655,50 @@ func TestQueue_ExecuteWithRetries_FailAndDLQ(t *testing.T) {
 	defer mu.Unlock()
 	if count != 2 {
 		t.Errorf("expected 2 attempts, got %d", count)
+	}
+}
+
+func TestQueue_ExecuteWithRetries_BackoffCancelled(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t,
+		WithMaxRetries(5),
+		WithBackoff(FixedBackoff{Duration: 5 * time.Second}),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	env := newEnvelope("t", nil, nil)
+	var count atomic.Int32
+	q.executeWithRetries(ctx, env, &testJob{},
+		func(_ context.Context, _ *testJob) error {
+			count.Add(1)
+			return fmt.Errorf("fail")
+		})
+	if count.Load() != 1 {
+		t.Errorf("expected 1 attempt before backoff cancel, got %d", count.Load())
+	}
+}
+
+func TestQueue_SendToDLQ_ProduceError(t *testing.T) {
+	t.Parallel()
+	b := &failProduceBroker{produceErr: fmt.Errorf("DLQ down")}
+	q, err := New[*testJob](b, WithDLQ(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	var errReported atomic.Bool
+	q.opts.errorHandler = errorHandlerFunc(func(ec ErrorContext) {
+		if errors.Is(ec.Err, ErrSendToDLQ) {
+			errReported.Store(true)
+		}
+	})
+	env := newEnvelope(q.Topic(), []byte("test"), nil)
+	q.sendToDLQ(env)
+	if !errReported.Load() {
+		t.Error("expected ErrSendToDLQ to be reported")
 	}
 }
 
@@ -707,4 +745,23 @@ func TestQueue_GetDLQTopic_AllVariants(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestQueue_Produce_SerializerError(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithSerializer(failSerializer{}))
+	err := q.Produce(context.Background(), &testJob{Msg: "x"})
+	if !errors.Is(err, ErrMarshal) {
+		t.Errorf("expected ErrMarshal, got %v", err)
+	}
+}
+
+type failSerializer struct{}
+
+func (failSerializer) Marshal(_ any) ([]byte, error) {
+	return nil, fmt.Errorf("marshal boom")
+}
+
+func (failSerializer) Unmarshal(_ []byte, _ any) error {
+	return fmt.Errorf("unmarshal boom")
 }

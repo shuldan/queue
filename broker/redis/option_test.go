@@ -1,12 +1,9 @@
 package redis
 
 import (
-	"context"
 	"testing"
 	"time"
 )
-
-var _ context.Context = context.Background()
 
 func applyOpts(opts ...Option) *options {
 	o := &options{}
