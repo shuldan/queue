@@ -18,27 +18,19 @@ type options struct {
 }
 
 func WithStreamKeyFormat(format string) Option {
-	return func(o *options) {
-		o.streamKeyFormat = format
-	}
+	return func(o *options) { o.streamKeyFormat = format }
 }
 
 func WithConsumerGroup(group string) Option {
-	return func(o *options) {
-		o.consumerGroup = group
-	}
+	return func(o *options) { o.consumerGroup = group }
 }
 
 func WithProcessingTimeout(timeout time.Duration) Option {
-	return func(o *options) {
-		o.processingTimeout = timeout
-	}
+	return func(o *options) { o.processingTimeout = timeout }
 }
 
 func WithClaimInterval(interval time.Duration) Option {
-	return func(o *options) {
-		o.claimInterval = interval
-	}
+	return func(o *options) { o.claimInterval = interval }
 }
 
 func WithMaxClaimBatch(n int) Option {
@@ -50,31 +42,21 @@ func WithMaxClaimBatch(n int) Option {
 }
 
 func WithBlockTimeout(timeout time.Duration) Option {
-	return func(o *options) {
-		o.blockTimeout = timeout
-	}
+	return func(o *options) { o.blockTimeout = timeout }
 }
 
 func WithMaxStreamLength(maxLen int64) Option {
-	return func(o *options) {
-		o.maxStreamLength = maxLen
-	}
+	return func(o *options) { o.maxStreamLength = maxLen }
 }
 
 func WithApproximateTrimming(enabled bool) Option {
-	return func(o *options) {
-		o.approximateTrim = enabled
-	}
+	return func(o *options) { o.approximateTrim = enabled }
 }
 
 func WithClaim(enabled bool) Option {
-	return func(o *options) {
-		o.enableClaim = enabled
-	}
+	return func(o *options) { o.enableClaim = enabled }
 }
 
 func WithConsumerPrefix(prefix string) Option {
-	return func(o *options) {
-		o.consumerPrefix = prefix
-	}
+	return func(o *options) { o.consumerPrefix = prefix }
 }

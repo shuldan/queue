@@ -5,130 +5,75 @@ import (
 	"time"
 )
 
-func TestFixedBackoff_Delay(t *testing.T) {
+func TestFixedBackoff_Delay_ReturnsFixedDuration(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
+	cases := []struct {
 		name     string
 		duration time.Duration
 		attempt  int
-		expected time.Duration
 	}{
-		{"zero_duration_zero_attempt", 0, 0, 0},
-		{"one_second_zero_attempt", time.Second, 0, time.Second},
-		{"one_second_five_attempts", time.Second, 5, time.Second},
-		{"five_seconds_ten_attempts", 5 * time.Second, 10, 5 * time.Second},
-		{"negative_attempt", time.Second, -1, time.Second},
+		{"zero", 0, 0},
+		{"one_second", time.Second, 5},
+		{"negative_attempt", time.Millisecond, -1},
 	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			fb := FixedBackoff{Duration: tt.duration}
-			got := fb.Delay(tt.attempt)
-			if got != tt.expected {
-				t.Errorf("expected %v, got %v", tt.expected, got)
+			fb := FixedBackoff{Duration: tc.duration}
+			got := fb.Delay(tc.attempt)
+			if got != tc.duration {
+				t.Errorf("expected %v, got %v", tc.duration, got)
 			}
 		})
 	}
 }
 
-func TestExponentialBackoff_Delay_NegativeAttempt(t *testing.T) {
+func TestExponentialBackoff_Delay_AllBranches(t *testing.T) {
 	t.Parallel()
+	base := time.Millisecond
+	maxD := time.Second
+	eb := ExponentialBackoff{Base: base, MaxDelay: maxD}
 
-	eb := ExponentialBackoff{
-		Base:     time.Second,
-		MaxDelay: time.Minute,
-	}
-
-	got := eb.Delay(-1)
-	if got != time.Second {
-		t.Errorf("expected %v, got %v", time.Second, got)
-	}
-}
-
-func TestExponentialBackoff_Delay_AttemptExceedsMax(t *testing.T) {
-	t.Parallel()
-
-	eb := ExponentialBackoff{
-		Base:     time.Second,
-		MaxDelay: time.Minute,
-	}
-
-	got := eb.Delay(63)
-	if got != time.Minute {
-		t.Errorf("expected %v, got %v", time.Minute, got)
-	}
-}
-
-func TestExponentialBackoff_Delay_DelayExceedsMax(t *testing.T) {
-	t.Parallel()
-
-	eb := ExponentialBackoff{
-		Base:     time.Second,
-		MaxDelay: 10 * time.Second,
-	}
-
-	got := eb.Delay(10)
-	if got != 10*time.Second {
-		t.Errorf("expected %v, got %v", 10*time.Second, got)
-	}
-}
-
-func TestExponentialBackoff_Delay_NormalCase(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		base     time.Duration
-		maxDelay time.Duration
-		attempt  int
-		expected time.Duration
+	cases := []struct {
+		name    string
+		attempt int
+		want    time.Duration
 	}{
-		{"attempt_0", time.Second, time.Hour, 0, time.Second},
-		{"attempt_1", time.Second, time.Hour, 1, 2 * time.Second},
-		{"attempt_2", time.Second, time.Hour, 2, 4 * time.Second},
-		{"attempt_3", time.Second, time.Hour, 3, 8 * time.Second},
+		{"negative_attempt", -1, base},
+		{"zero_attempt", 0, base},
+		{"attempt_1", 1, 2 * base},
+		{"attempt_5", 5, 32 * base},
+		{"attempt_over_maxShift", 63, maxD},
+		{"attempt_exactly_maxShift", 62, maxD},
+		{"overflow_returns_max", 50, maxD},
 	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			eb := ExponentialBackoff{Base: tt.base, MaxDelay: tt.maxDelay}
-			got := eb.Delay(tt.attempt)
-			if got != tt.expected {
-				t.Errorf("expected %v, got %v", tt.expected, got)
+			got := eb.Delay(tc.attempt)
+			if got != tc.want {
+				t.Errorf("attempt=%d: expected %v, got %v", tc.attempt, tc.want, got)
 			}
 		})
 	}
 }
 
-func TestExponentialBackoff_Delay_Overflow(t *testing.T) {
+func TestExponentialBackoff_Delay_OverflowWrap(t *testing.T) {
 	t.Parallel()
-
-	eb := ExponentialBackoff{
-		Base:     1 << 62 * time.Nanosecond,
-		MaxDelay: time.Hour,
-	}
-
-	got := eb.Delay(2)
-	if got != time.Hour {
-		t.Errorf("expected %v, got %v", time.Hour, got)
+	eb := ExponentialBackoff{Base: time.Hour, MaxDelay: 2 * time.Hour}
+	got := eb.Delay(62)
+	if got != 2*time.Hour {
+		t.Errorf("expected max delay %v, got %v", 2*time.Hour, got)
 	}
 }
 
-func TestNoBackoff_Delay(t *testing.T) {
+func TestNoBackoff_Delay_AlwaysZero(t *testing.T) {
 	t.Parallel()
-
-	tests := []int{-100, -1, 0, 1, 100, 1000}
-
 	nb := NoBackoff{}
-	for _, attempt := range tests {
+	for _, attempt := range []int{-1, 0, 1, 100} {
 		got := nb.Delay(attempt)
 		if got != 0 {
-			t.Errorf("attempt %d: expected 0, got %v", attempt, got)
+			t.Errorf("attempt=%d: expected 0, got %v", attempt, got)
 		}
 	}
 }

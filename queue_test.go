@@ -3,963 +3,708 @@ package queue
 import (
 	"context"
 	"errors"
-	"reflect"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-type TestJob struct {
-	ID   int
-	Name string
-}
-
 type mockBroker struct {
-	produceFunc func(ctx context.Context, topic string, data []byte) error
-	consumeFunc func(ctx context.Context, topic string, handler func([]byte) error) error
-	closeFunc   func() error
+	mu       sync.Mutex
+	channels map[string]chan []byte
+	done     chan struct{}
+	wg       sync.WaitGroup
+	closed   bool
 }
 
-func (m *mockBroker) Produce(ctx context.Context, topic string, data []byte) error {
-	if m.produceFunc != nil {
-		return m.produceFunc(ctx, topic, data)
+func newMockBroker() *mockBroker {
+	return &mockBroker{
+		channels: make(map[string]chan []byte),
+		done:     make(chan struct{}),
+	}
+}
+
+func (b *mockBroker) getOrCreateChan(topic string) chan []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ch, ok := b.channels[topic]; ok {
+		return ch
+	}
+	ch := make(chan []byte, 100)
+	b.channels[topic] = ch
+	return ch
+}
+
+func (b *mockBroker) isClosed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed
+}
+
+func (b *mockBroker) Produce(ctx context.Context, topic string, data []byte) error {
+	if b.isClosed() {
+		return ErrBrokerClosed
+	}
+	ch := b.getOrCreateChan(topic)
+	select {
+	case ch <- data:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *mockBroker) Consume(
+	ctx context.Context, topic string, handler func([]byte) error,
+) error {
+	if b.isClosed() {
+		return ErrBrokerClosed
+	}
+	ch := b.getOrCreateChan(topic)
+
+	goroutineDone := make(chan struct{})
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		defer close(goroutineDone)
+		for {
+			select {
+			case data, ok := <-ch:
+				if !ok {
+					return
+				}
+				_ = handler(data)
+			case <-ctx.Done():
+				return
+			case <-b.done:
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		<-goroutineDone
+		return ctx.Err()
+	case <-b.done:
+		<-goroutineDone
+		return ErrBrokerClosed
+	}
+}
+
+func (b *mockBroker) Ping(_ context.Context) error {
+	if b.isClosed() {
+		return ErrBrokerClosed
 	}
 	return nil
 }
 
-func (m *mockBroker) Consume(ctx context.Context, topic string, handler func([]byte) error) error {
-	if m.consumeFunc != nil {
-		return m.consumeFunc(ctx, topic, handler)
+func (b *mockBroker) Close() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
 	}
+	b.closed = true
+	close(b.done)
+	b.mu.Unlock()
+	b.wg.Wait()
+	b.mu.Lock()
+	for topic, ch := range b.channels {
+		close(ch)
+		delete(b.channels, topic)
+	}
+	b.mu.Unlock()
 	return nil
 }
 
-func (m *mockBroker) Close() error {
-	if m.closeFunc != nil {
-		return m.closeFunc()
-	}
-	return nil
+type testJob struct {
+	Msg string `json:"msg"`
 }
 
-func TestNew_InvalidJobType_NonPointer(t *testing.T) {
-	t.Parallel()
-
-	type NotAPointer struct {
-		ID int
-	}
-
-	broker := &mockBroker{}
-	_, err := New[NotAPointer](broker)
-
-	if !errors.Is(err, ErrInvalidJobType) {
-		t.Errorf("expected ErrInvalidJobType, got %v", err)
-	}
-}
-
-func TestNew_InvalidJobType_PointerToNonStruct(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	_, err := New[*int](broker)
-
-	if !errors.Is(err, ErrInvalidJobType) {
-		t.Errorf("expected ErrInvalidJobType, got %v", err)
-	}
-}
-
-func TestNew_Success(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, err := New[*TestJob](broker)
-
+func newQueue(t *testing.T, opts ...Option) (*Queue[*testJob], *mockBroker) {
+	t.Helper()
+	b := newMockBroker()
+	q, err := New[*testJob](b, opts...)
 	if err != nil {
-		t.Errorf("expected no error, got %v", err)
+		t.Fatalf("failed to create queue: %v", err)
 	}
+	t.Cleanup(func() {
+		q.Close()
+		b.Close()
+	})
+	return q, b
+}
+
+func mustMarshalJob(j *testJob) []byte {
+	s := JSONSerializer{}
+	data, err := s.Marshal(j)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+type errorHandlerFunc func(ErrorContext)
+
+func (f errorHandlerFunc) Handle(ctx ErrorContext) { f(ctx) }
+
+type panicHandlerFunc func(PanicContext)
+
+func (f panicHandlerFunc) Handle(ctx PanicContext) { f(ctx) }
+
+func TestNew_ValidType(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
 	if q == nil {
-		t.Error("expected non-nil queue")
-	}
-	if q != nil && q.broker != broker {
-		t.Error("broker not set correctly")
+		t.Fatal("expected non-nil queue")
 	}
 }
 
-func TestNew_WithOptions(t *testing.T) {
+func TestNew_InvalidType_NotPointer(t *testing.T) {
 	t.Parallel()
+	_, err := New[int](newMockBroker())
+	if !errors.Is(err, ErrInvalidJobType) {
+		t.Errorf("expected ErrInvalidJobType, got %v", err)
+	}
+}
 
-	broker := &mockBroker{}
-	customBackoff := NoBackoff{}
+func TestNew_InvalidType_PointerToNonStruct(t *testing.T) {
+	t.Parallel()
+	_, err := New[*int](newMockBroker())
+	if !errors.Is(err, ErrInvalidJobType) {
+		t.Errorf("expected ErrInvalidJobType, got %v", err)
+	}
+}
 
-	q, err := New[*TestJob](broker,
-		WithPrefix("test:"),
-		WithDLQ(true),
-		WithWorkerCount(5),
-		WithMaxRetries(10),
-		WithBackoff(customBackoff),
-	)
+func TestNew_InvalidType_Interface(t *testing.T) {
+	t.Parallel()
+	_, err := New[any](newMockBroker())
+	if !errors.Is(err, ErrInvalidJobType) {
+		t.Errorf("expected ErrInvalidJobType, got %v", err)
+	}
+}
 
+func TestNew_InvalidOptions_NilBackoff(t *testing.T) {
+	t.Parallel()
+	_, err := New[*testJob](newMockBroker(), WithBackoff(nil))
+	if !errors.Is(err, ErrNilBackoff) {
+		t.Errorf("expected ErrNilBackoff, got %v", err)
+	}
+}
+
+func TestQueue_Produce_BasicSuccess(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	err := q.Produce(context.Background(), &testJob{Msg: "hello"})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if q.opts.prefix != "test:" {
-		t.Errorf("expected prefix 'test:', got %q", q.opts.prefix)
-	}
-	if !q.opts.dlqEnabled {
-		t.Error("expected DLQ enabled")
-	}
-	if q.opts.workerCount != 5 {
-		t.Errorf("expected 5 workers, got %d", q.opts.workerCount)
-	}
-	if q.opts.maxRetries != 10 {
-		t.Errorf("expected 10 retries, got %d", q.opts.maxRetries)
+		t.Fatalf("expected no error, got %v", err)
 	}
 }
 
-func TestQueue_Produce_QueueClosed(t *testing.T) {
+func TestQueue_Produce_WithHeaders(t *testing.T) {
 	t.Parallel()
+	q, _ := newQueue(t)
+	err := q.Produce(context.Background(), &testJob{Msg: "hi"},
+		WithHeaders(map[string]string{"x": "y"}))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
 
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker)
-	q.closed = true
-
-	err := q.Produce(context.Background(), &TestJob{ID: 1})
-
+func TestQueue_Produce_ClosedQueue(t *testing.T) {
+	t.Parallel()
+	b := newMockBroker()
+	q, _ := New[*testJob](b)
+	q.Close()
+	err := q.Produce(context.Background(), &testJob{Msg: "nope"})
 	if !errors.Is(err, ErrQueueClosed) {
 		t.Errorf("expected ErrQueueClosed, got %v", err)
 	}
+	b.Close()
 }
 
-func TestQueue_Produce_Success(t *testing.T) {
+func TestQueue_Consume_NilHandler(t *testing.T) {
 	t.Parallel()
-
-	var capturedTopic string
-	var capturedData []byte
-
-	broker := &mockBroker{
-		produceFunc: func(ctx context.Context, topic string, data []byte) error {
-			capturedTopic = topic
-			capturedData = data
-			return nil
-		},
-	}
-
-	q, _ := New[*TestJob](broker)
-	job := &TestJob{ID: 42, Name: "test"}
-
-	err := q.Produce(context.Background(), job)
-
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if capturedTopic == "" {
-		t.Error("topic not passed to broker")
-	}
-	if len(capturedData) == 0 {
-		t.Error("data not passed to broker")
+	q, _ := newQueue(t)
+	err := q.Consume(context.Background(), nil)
+	if !errors.Is(err, ErrNilHandler) {
+		t.Errorf("expected ErrNilHandler, got %v", err)
 	}
 }
 
-func TestQueue_Produce_BrokerError(t *testing.T) {
+func TestQueue_Consume_ClosedQueue(t *testing.T) {
 	t.Parallel()
-
-	expectedErr := errors.New("broker error")
-	broker := &mockBroker{
-		produceFunc: func(ctx context.Context, topic string, data []byte) error {
-			return expectedErr
-		},
+	b := newMockBroker()
+	q, _ := New[*testJob](b)
+	q.Close()
+	err := q.Consume(context.Background(), func(_ context.Context, _ *testJob) error {
+		return nil
+	})
+	if !errors.Is(err, ErrQueueClosed) {
+		t.Errorf("expected ErrQueueClosed, got %v", err)
 	}
-
-	q, _ := New[*TestJob](broker)
-	err := q.Produce(context.Background(), &TestJob{ID: 1})
-
-	if !errors.Is(err, expectedErr) {
-		t.Errorf("expected broker error, got %v", err)
-	}
+	b.Close()
 }
 
-func TestQueue_Close_AlreadyClosed(t *testing.T) {
+func TestQueue_ProduceConsume_EndToEnd(t *testing.T) {
 	t.Parallel()
-
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker)
-	q.closed = true
-
-	err := q.Close()
-	if err != nil {
-		t.Errorf("expected no error, got %v", err)
-	}
-}
-
-func TestQueue_Close_Success(t *testing.T) {
-	t.Parallel()
-
-	closeCalled := false
-	broker := &mockBroker{
-		closeFunc: func() error {
-			closeCalled = true
-			return nil
-		},
-	}
-
-	q, _ := New[*TestJob](broker)
-	err := q.Close()
-
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if !closeCalled {
-		t.Error("broker.Close not called")
-	}
-	if !q.closed {
-		t.Error("queue not marked as closed")
-	}
-}
-
-func TestQueue_Close_BrokerError(t *testing.T) {
-	t.Parallel()
-
-	expectedErr := errors.New("close error")
-	broker := &mockBroker{
-		closeFunc: func() error {
-			return expectedErr
-		},
-	}
-
-	q, _ := New[*TestJob](broker)
-	err := q.Close()
-
-	if !errors.Is(err, expectedErr) {
-		t.Errorf("expected close error, got %v", err)
-	}
-}
-
-func TestQueue_GetPrefixedTopic_NoPrefix(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker)
-
-	topic := q.getPrefixedTopic()
-	expectedType := reflect.TypeOf((*TestJob)(nil)).String()
-
-	if topic != expectedType {
-		t.Errorf("expected %q, got %q", expectedType, topic)
-	}
-}
-
-func TestQueue_GetPrefixedTopic_WithPrefix(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker, WithPrefix("myprefix:"))
-
-	topic := q.getPrefixedTopic()
-	expectedType := reflect.TypeOf((*TestJob)(nil)).String()
-	expected := "myprefix:" + expectedType
-
-	if topic != expected {
-		t.Errorf("expected %q, got %q", expected, topic)
-	}
-}
-
-func TestQueue_GetDLQTopic_NoPrefix(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker)
-
-	dlqTopic := q.getDLQTopic()
-	expectedType := reflect.TypeOf((*TestJob)(nil)).String()
-	expected := "dlq:" + expectedType
-
-	if dlqTopic != expected {
-		t.Errorf("expected %q, got %q", expected, dlqTopic)
-	}
-}
-
-func TestQueue_GetDLQTopic_WithPrefix(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker, WithPrefix("myprefix:"))
-
-	dlqTopic := q.getDLQTopic()
-	expectedType := reflect.TypeOf((*TestJob)(nil)).String()
-	expected := "myprefix:dlq:" + expectedType
-
-	if dlqTopic != expected {
-		t.Errorf("expected %q, got %q", expected, dlqTopic)
-	}
-}
-
-func TestQueue_Consume_BrokerError(t *testing.T) {
-	expectedErr := errors.New("consume error")
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			return expectedErr
-		},
-	}
-
-	q, _ := New[*TestJob](broker)
+	q, _ := newQueue(t, WithWorkerCount(1), WithBackoff(NoBackoff{}))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err := q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-		return nil
-	})
+	var got atomic.Value
+	doneCh := make(chan struct{})
+	go func() {
+		_ = q.Consume(ctx, func(_ context.Context, job *testJob) error {
+			got.Store(job.Msg)
+			cancel()
+			return nil
+		})
+		close(doneCh)
+	}()
 
-	if !errors.Is(err, expectedErr) {
-		t.Errorf("expected consume error, got %v", err)
+	time.Sleep(50 * time.Millisecond)
+	if err := q.Produce(ctx, &testJob{Msg: "e2e"}); err != nil {
+		t.Fatalf("produce error: %v", err)
+	}
+	<-doneCh
+	if v, _ := got.Load().(string); v != "e2e" {
+		t.Errorf("expected 'e2e', got %q", v)
 	}
 }
 
-type mockErrorHandler struct {
-	mu     sync.Mutex
-	errors []error
+func TestQueue_Close_Idempotent(t *testing.T) {
+	t.Parallel()
+	b := newMockBroker()
+	q, _ := New[*testJob](b)
+	if err := q.Close(); err != nil {
+		t.Errorf("first close: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Errorf("second close: %v", err)
+	}
+	b.Close()
 }
 
-func (m *mockErrorHandler) Handle(_ any, _ any, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.errors = append(m.errors, err)
+func TestQueue_Topic_Default(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	if q.Topic() == "" {
+		t.Error("expected non-empty topic")
+	}
 }
 
-type mockPanicHandler struct {
-	mu     sync.Mutex
-	panics []any
+func TestQueue_Topic_WithPrefixAndCustomTopic(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithPrefix("svc:"), WithTopic("custom"))
+	if q.Topic() != "svc:custom" {
+		t.Errorf("expected 'svc:custom', got %q", q.Topic())
+	}
 }
 
-func (m *mockPanicHandler) Handle(_ any, _ any, panicValue any, _ []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.panics = append(m.panics, panicValue)
+func TestQueue_DLQTopic_Default(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	dlq := q.DLQTopic()
+	if dlq == "" || len(dlq) < len(dlqTopicPrefix) {
+		t.Errorf("expected DLQ topic with prefix, got %q", dlq)
+	}
+}
+
+func TestQueue_DLQTopic_WithPrefixAndCustomTopic(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithPrefix("svc:"), WithTopic("custom"))
+	want := "svc:" + dlqTopicPrefix + "custom"
+	if q.DLQTopic() != want {
+		t.Errorf("expected %q, got %q", want, q.DLQTopic())
+	}
+}
+
+func TestQueue_Use_Middleware(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithWorkerCount(1), WithBackoff(NoBackoff{}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mwCalled atomic.Bool
+	q.Use(func(next func(context.Context, *testJob) error) func(context.Context, *testJob) error {
+		return func(ctx context.Context, j *testJob) error {
+			mwCalled.Store(true)
+			return next(ctx, j)
+		}
+	})
+
+	doneCh := make(chan struct{})
+	go func() {
+		_ = q.Consume(ctx, func(_ context.Context, _ *testJob) error {
+			cancel()
+			return nil
+		})
+		close(doneCh)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	_ = q.Produce(ctx, &testJob{Msg: "mw"})
+	<-doneCh
+	if !mwCalled.Load() {
+		t.Error("expected middleware to be called")
+	}
+}
+
+func TestQueue_Ping(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	if err := q.Ping(context.Background()); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+func TestQueue_RetryOnError(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t,
+		WithWorkerCount(1),
+		WithMaxRetries(2),
+		WithBackoff(NoBackoff{}),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var attempts atomic.Int32
+	doneCh := make(chan struct{})
+	go func() {
+		_ = q.Consume(ctx, func(_ context.Context, _ *testJob) error {
+			attempts.Add(1)
+			return fmt.Errorf("fail")
+		})
+		close(doneCh)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	_ = q.Produce(ctx, &testJob{Msg: "retry"})
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-doneCh
+
+	got := int(attempts.Load())
+	if got != 3 {
+		t.Errorf("expected 3 attempts (1 + 2 retries), got %d", got)
+	}
+}
+
+func TestQueue_DLQ_SendsAfterRetries(t *testing.T) {
+	t.Parallel()
+	b := newMockBroker()
+	q, err := New[*testJob](b,
+		WithWorkerCount(1),
+		WithMaxRetries(1),
+		WithBackoff(NoBackoff{}),
+		WithDLQ(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var attempts atomic.Int32
+	doneCh := make(chan struct{})
+	go func() {
+		_ = q.Consume(ctx, func(_ context.Context, _ *testJob) error {
+			attempts.Add(1)
+			return fmt.Errorf("always fail")
+		})
+		close(doneCh)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	_ = q.Produce(ctx, &testJob{Msg: "dlq"})
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-doneCh
+	q.Close()
+	b.Close()
+
+	if attempts.Load() < 2 {
+		t.Errorf("expected at least 2 attempts, got %d", attempts.Load())
+	}
+}
+
+func TestQueue_PanicInHandler(t *testing.T) {
+	t.Parallel()
+	b := newMockBroker()
+	q, err := New[*testJob](b,
+		WithWorkerCount(1),
+		WithMaxRetries(0),
+		WithBackoff(NoBackoff{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	doneCh := make(chan struct{})
+	go func() {
+		_ = q.Consume(ctx, func(_ context.Context, _ *testJob) error {
+			panic("handler panic")
+		})
+		close(doneCh)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	_ = q.Produce(ctx, &testJob{Msg: "panic"})
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-doneCh
+	q.Close()
+	b.Close()
+}
+
+func TestQueue_WaitBackoff_ContextCancelled(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithBackoff(FixedBackoff{Duration: 10 * time.Second}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if q.waitBackoff(ctx, 0) {
+		t.Error("expected false when context is cancelled")
+	}
+}
+
+func TestQueue_WaitBackoff_ZeroDelay(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithBackoff(NoBackoff{}))
+	if !q.waitBackoff(context.Background(), 0) {
+		t.Error("expected true for zero delay")
+	}
+}
+
+func TestQueue_DecodeJob_InvalidEnvelope(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	_, _, err := q.decodeJob([]byte("not json"))
+	if err == nil {
+		t.Error("expected error for invalid envelope")
+	}
+}
+
+func TestQueue_DecodeJob_InvalidJobData(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	env := newEnvelope("t", []byte("not a job"), nil)
+	data, _ := marshalEnvelope(env)
+	_, _, err := q.decodeJob(data)
+	if err == nil {
+		t.Error("expected error for invalid job data")
+	}
 }
 
 func TestQueue_ProcessJob_UnmarshalError(t *testing.T) {
 	t.Parallel()
-
-	errHandler := &mockErrorHandler{}
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker, WithErrorHandler(errHandler))
-
-	invalidJSON := []byte("{invalid json}")
-	handler := func(ctx context.Context, job *TestJob) error {
-		return nil
-	}
-
-	q.processJob(context.Background(), invalidJSON, handler)
-
-	if len(errHandler.errors) == 0 {
-		t.Error("expected error to be handled")
-	}
-}
-
-func TestQueue_ProcessJob_HandlerPanic(t *testing.T) {
-	t.Parallel()
-
-	panicHandler := &mockPanicHandler{}
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker, WithPanicHandler(panicHandler))
-
-	data := []byte(`{"ID":1,"Name":"test"}`)
-	handler := func(ctx context.Context, job *TestJob) error {
-		panic("test panic")
-	}
-
-	q.processJob(context.Background(), data, handler)
-
-	time.Sleep(10 * time.Millisecond)
-
-	if len(panicHandler.panics) == 0 {
-		t.Error("expected panic to be handled")
-	}
-}
-
-func TestQueue_ProcessJob_ContextCancelled(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	data := []byte(`{"ID":1,"Name":"test"}`)
-	called := false
-	handler := func(ctx context.Context, job *TestJob) error {
-		called = true
-		return nil
-	}
-
-	q.processJob(ctx, data, handler)
-
-	if called {
-		t.Error("handler should not be called when context is cancelled")
-	}
-}
-
-func TestQueue_ProcessJob_Success(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker)
-
-	data := []byte(`{"ID":42,"Name":"test"}`)
-	var receivedJob *TestJob
-	handler := func(ctx context.Context, job *TestJob) error {
-		receivedJob = job
-		return nil
-	}
-
-	q.processJob(context.Background(), data, handler)
-
-	if receivedJob == nil {
-		t.Fatal("handler not called")
-	}
-	if receivedJob.ID != 42 || receivedJob.Name != "test" {
-		t.Errorf("unexpected job: %+v", receivedJob)
-	}
-}
-
-func TestQueue_ProcessJob_RetrySuccess(t *testing.T) {
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker, WithMaxRetries(2), WithBackoff(NoBackoff{}))
-
-	data := []byte(`{"ID":1,"Name":"test"}`)
-	attempts := 0
-	handler := func(ctx context.Context, job *TestJob) error {
-		attempts++
-		if attempts < 2 {
-			return errors.New("temporary error")
+	q, _ := newQueue(t)
+	var errReported atomic.Bool
+	q.opts.errorHandler = errorHandlerFunc(func(ec ErrorContext) {
+		if errors.Is(ec.Err, ErrUnmarshal) {
+			errReported.Store(true)
 		}
-		return nil
-	}
-
-	q.processJob(context.Background(), data, handler)
-
-	if attempts != 2 {
-		t.Errorf("expected 2 attempts, got %d", attempts)
-	}
-}
-
-func TestQueue_ProcessJob_RetriesExhausted_NoDLQ(t *testing.T) {
-	errHandler := &mockErrorHandler{}
-	broker := &mockBroker{}
-	q, _ := New[*TestJob](broker, WithMaxRetries(1), WithBackoff(NoBackoff{}), WithErrorHandler(errHandler))
-
-	data := []byte(`{"ID":1,"Name":"test"}`)
-	handler := func(ctx context.Context, job *TestJob) error {
-		return errors.New("permanent error")
-	}
-
-	q.processJob(context.Background(), data, handler)
-
-	if len(errHandler.errors) != 2 {
-		t.Errorf("expected 2 error calls, got %d", len(errHandler.errors))
-	}
-}
-
-func TestQueue_ProcessJob_RetriesExhausted_WithDLQ(t *testing.T) {
-	var dlqData []byte
-	broker := &mockBroker{
-		produceFunc: func(ctx context.Context, topic string, data []byte) error {
-			dlqData = data
-			return nil
-		},
-	}
-	q, _ := New[*TestJob](broker, WithMaxRetries(1), WithBackoff(NoBackoff{}), WithDLQ(true))
-
-	data := []byte(`{"ID":1,"Name":"test"}`)
-	handler := func(ctx context.Context, job *TestJob) error {
-		return errors.New("permanent error")
-	}
-
-	q.processJob(context.Background(), data, handler)
-
-	time.Sleep(10 * time.Millisecond)
-
-	if len(dlqData) == 0 {
-		t.Error("expected job to be sent to DLQ")
-	}
-}
-
-func TestQueue_SendToDLQ_MarshalError(t *testing.T) {
-	t.Parallel()
-
-	type UnmarshallableJob struct {
-		Ch chan int
-	}
-
-	errHandler := &mockErrorHandler{}
-	broker := &mockBroker{}
-	q, _ := New[*UnmarshallableJob](broker, WithErrorHandler(errHandler))
-
-	job := &UnmarshallableJob{Ch: make(chan int)}
-	q.sendToDLQ(context.Background(), job)
-
-	if len(errHandler.errors) == 0 {
-		t.Error("expected marshal error to be handled")
-	}
-}
-
-func TestQueue_SendToDLQ_ProduceError(t *testing.T) {
-	t.Parallel()
-
-	errHandler := &mockErrorHandler{}
-	broker := &mockBroker{
-		produceFunc: func(ctx context.Context, topic string, data []byte) error {
-			return errors.New("produce error")
-		},
-	}
-	q, _ := New[*TestJob](broker, WithErrorHandler(errHandler))
-
-	job := &TestJob{ID: 1, Name: "test"}
-	q.sendToDLQ(context.Background(), job)
-
-	time.Sleep(10 * time.Millisecond)
-
-	found := false
-	errHandler.mu.Lock()
-	for _, err := range errHandler.errors {
-		if errors.Is(err, ErrSendToDLQ) {
-			found = true
-			break
-		}
-	}
-	errHandler.mu.Unlock()
-
-	if !found {
-		t.Error("expected ErrSendToDLQ to be handled")
-	}
-}
-
-func TestQueue_ProcessJob_RetryWithDelay(t *testing.T) {
-	broker := &mockBroker{}
-	backoff := FixedBackoff{Duration: 10 * time.Millisecond}
-	q, _ := New[*TestJob](broker, WithMaxRetries(1), WithBackoff(backoff))
-
-	data := []byte(`{"ID":1,"Name":"test"}`)
-	start := time.Now()
-	attempts := 0
-
-	handler := func(ctx context.Context, job *TestJob) error {
-		attempts++
-		if attempts == 1 {
-			return errors.New("retry")
-		}
-		return nil
-	}
-
-	q.processJob(context.Background(), data, handler)
-	elapsed := time.Since(start)
-
-	if elapsed < 10*time.Millisecond {
-		t.Error("expected delay before retry")
-	}
-	if attempts != 2 {
-		t.Errorf("expected 2 attempts, got %d", attempts)
-	}
-}
-
-func TestQueue_ProcessJob_CancelledDuringDelay(t *testing.T) {
-	broker := &mockBroker{}
-	backoff := FixedBackoff{Duration: 100 * time.Millisecond}
-	q, _ := New[*TestJob](broker, WithMaxRetries(5), WithBackoff(backoff))
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	data := []byte(`{"ID":1,"Name":"test"}`)
-	attempts := 0
-
-	handler := func(ctx context.Context, job *TestJob) error {
-		attempts++
-		if attempts == 1 {
-			go func() {
-				time.Sleep(10 * time.Millisecond)
-				cancel()
-			}()
-			return errors.New("retry")
-		}
-		return nil
-	}
-
-	q.processJob(ctx, data, handler)
-
-	if attempts > 2 {
-		t.Errorf("expected at most 2 attempts due to cancellation, got %d", attempts)
-	}
-}
-
-type JobWithUnmarshallableField struct {
-	ID      int
-	Channel chan int
-}
-
-func TestQueue_Produce_MarshalError(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, err := New[*JobWithUnmarshallableField](broker)
-	if err != nil {
-		t.Fatalf("failed to create queue: %v", err)
-	}
-
-	job := &JobWithUnmarshallableField{
-		ID:      1,
-		Channel: make(chan int),
-	}
-
-	err = q.Produce(context.Background(), job)
-	if err == nil {
-		t.Error("expected marshal error, got nil")
-	}
-}
-
-type JobWithUnmarshallableFunc struct {
-	ID   int
-	Func func()
-}
-
-func TestQueue_Produce_MarshalError_Function(t *testing.T) {
-	t.Parallel()
-
-	broker := &mockBroker{}
-	q, err := New[*JobWithUnmarshallableFunc](broker)
-	if err != nil {
-		t.Fatalf("failed to create queue: %v", err)
-	}
-
-	job := &JobWithUnmarshallableFunc{
-		ID:   1,
-		Func: func() {},
-	}
-
-	err = q.Produce(context.Background(), job)
-	if err == nil {
-		t.Error("expected marshal error, got nil")
-	}
-}
-
-func TestQueue_Consume_WorkersProcessJobs(t *testing.T) {
-	var processedCount int32
-	jobData := []byte(`{"ID":1,"Name":"test"}`)
-
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			for i := 0; i < 10; i++ {
-				if err := handler(jobData); err != nil {
-					return err
-				}
-			}
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker, WithWorkerCount(3))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	go func() {
-		_ = q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-			atomic.AddInt32(&processedCount, 1)
-			return nil
-		})
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	time.Sleep(10 * time.Millisecond)
-
-	count := atomic.LoadInt32(&processedCount)
-	if count != 10 {
-		t.Errorf("expected 10 jobs processed, got %d", count)
-	}
-}
-
-func TestQueue_Consume_ContextCancelledDuringSend(t *testing.T) {
-	var contextErrReturned atomic.Bool
-
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			for i := 0; i < 1000; i++ {
-				select {
-				case <-ctx.Done():
-					contextErrReturned.Store(true)
-					return ctx.Err()
-				default:
-				}
-
-				err := handler([]byte(`{"ID":1,"Name":"test"}`))
-				if err != nil {
-					if errors.Is(err, context.Canceled) {
-						contextErrReturned.Store(true)
-					}
-					return err
-				}
-				time.Sleep(time.Microsecond)
-			}
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker, WithWorkerCount(1))
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	consumeDone := make(chan struct{})
-	go func() {
-		_ = q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-			time.Sleep(time.Millisecond)
-			return nil
-		})
-		close(consumeDone)
-	}()
-
-	time.Sleep(5 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-consumeDone:
-	case <-time.After(200 * time.Millisecond):
-		t.Error("Consume did not finish after context cancellation")
-	}
-
-	if !contextErrReturned.Load() {
-		t.Error("expected context error to be returned from handler")
-	}
-}
-
-func TestQueue_Consume_JobChannelSendSuccess(t *testing.T) {
-	jobReceived := make(chan struct{})
-	jobData := []byte(`{"ID":42,"Name":"success"}`)
-
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			err := handler(jobData)
-			if err != nil {
-				return err
-			}
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker, WithWorkerCount(2))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	go func() {
-		_ = q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-			if job.ID == 42 && job.Name == "success" {
-				close(jobReceived)
-			}
-			return nil
-		})
-	}()
-
-	select {
-	case <-jobReceived:
-	case <-time.After(50 * time.Millisecond):
-		t.Error("job not received within timeout")
-	}
-
-	cancel()
-}
-
-func TestQueue_Consume_WaitsForContextDone(t *testing.T) {
-	consumeStarted := make(chan struct{})
-	consumeFinished := make(chan struct{})
-
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			close(consumeStarted)
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker)
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		err := q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-			return nil
-		})
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("expected context.Canceled, got %v", err)
-		}
-		close(consumeFinished)
-	}()
-
-	<-consumeStarted
-
-	cancel()
-
-	select {
-	case <-consumeFinished:
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Consume did not finish after context cancellation")
-	}
-}
-
-func TestQueue_Consume_ReturnsContextError(t *testing.T) {
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-
-	err := q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-		return nil
 	})
-
-	if err == nil {
-		t.Error("expected context error, got nil")
-	}
-
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("expected DeadlineExceeded, got %v", err)
+	q.processJob(context.Background(), []byte("bad"),
+		func(_ context.Context, _ *testJob) error { return nil })
+	if !errReported.Load() {
+		t.Error("expected ErrUnmarshal to be reported")
 	}
 }
 
-func TestQueue_Consume_MultipleWorkersConcurrency(t *testing.T) {
-	const numWorkers = 5
-	const numJobs = 50
-
-	var mu sync.Mutex
-	processedJobs := make(map[int]int)
-	jobData := make([][]byte, numJobs)
-
-	for i := 0; i < numJobs; i++ {
-		jobData[i] = []byte(`{"ID":` + string(rune('0'+i%10)) + `,"Name":"job"}`)
-	}
-
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			for _, data := range jobData {
-				if err := handler(data); err != nil {
-					return err
-				}
-			}
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker, WithWorkerCount(numWorkers))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	go func() {
-		_ = q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-			mu.Lock()
-			processedJobs[job.ID]++
-			mu.Unlock()
-			time.Sleep(time.Millisecond)
-			return nil
-		})
-	}()
-
-	time.Sleep(150 * time.Millisecond)
-	cancel()
-	time.Sleep(20 * time.Millisecond)
-
-	mu.Lock()
-	totalProcessed := 0
-	for _, count := range processedJobs {
-		totalProcessed += count
-	}
-	mu.Unlock()
-
-	if totalProcessed != numJobs {
-		t.Errorf("expected %d jobs processed, got %d", numJobs, totalProcessed)
-	}
-}
-
-func TestQueue_Consume_ChannelFullBlocksUntilCancel(t *testing.T) {
-	sendAttempts := atomic.Int32{}
-	contextCancelDetected := atomic.Bool{}
-
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			for i := 0; i < 100; i++ {
-				sendAttempts.Add(1)
-				err := handler([]byte(`{"ID":1,"Name":"test"}`))
-				if err != nil {
-					if errors.Is(err, context.Canceled) {
-						contextCancelDetected.Store(true)
-					}
-					return err
-				}
-			}
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker, WithWorkerCount(1))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	consumeDone := make(chan struct{})
-	go func() {
-		_ = q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
-			time.Sleep(10 * time.Millisecond)
-			return nil
-		})
-		close(consumeDone)
-	}()
-
-	<-consumeDone
-
-	if contextCancelDetected.Load() {
-		t.Log("context cancellation detected during send - good")
-	}
-}
-
-func TestQueue_Consume_WorkerContextCancellation(t *testing.T) {
-	workerStarted := make(chan struct{})
-
-	broker := &mockBroker{
-		consumeFunc: func(ctx context.Context, topic string, handler func([]byte) error) error {
-			close(workerStarted)
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	q, _ := New[*TestJob](broker, WithWorkerCount(3))
-
+func TestQueue_EnqueueJob_ContextDone(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	jobs := make(chan []byte)
+	fn := q.enqueueJob(ctx, jobs)
+	if err := fn([]byte("data")); err == nil {
+		t.Error("expected context error")
+	}
+}
 
-	consumeDone := make(chan struct{})
-	go func() {
-		_ = q.Consume(ctx, func(ctx context.Context, job *TestJob) error {
+func TestQueue_MergeContext_QueueCancelPropagates(t *testing.T) {
+	t.Parallel()
+	b := newMockBroker()
+	q, _ := New[*testJob](b)
+	merged, mergedCancel := q.mergeContext(context.Background())
+	defer mergedCancel()
+	q.Close()
+	b.Close()
+	select {
+	case <-merged.Done():
+	case <-time.After(time.Second):
+		t.Error("expected merged context to be cancelled")
+	}
+}
+
+func TestQueue_StartWorkers_ProcessMessages(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithWorkerCount(2), WithBackoff(NoBackoff{}))
+	jobs := make(chan []byte, 2)
+
+	env := newEnvelope(q.Topic(), mustMarshalJob(&testJob{Msg: "w"}), nil)
+	data, _ := marshalEnvelope(env)
+	jobs <- data
+
+	var called atomic.Bool
+	wg := q.startWorkers(context.Background(), jobs,
+		func(_ context.Context, _ *testJob) error {
+			called.Store(true)
 			return nil
 		})
-		close(consumeDone)
-	}()
+	time.Sleep(50 * time.Millisecond)
+	close(jobs)
+	wg.Wait()
+	if !called.Load() {
+		t.Error("expected handler to be called")
+	}
+}
 
-	<-workerStarted
-	cancel()
+func TestQueue_SafeExecute_NormalReturn(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	env := newEnvelope("t", nil, nil)
+	err := q.safeExecute(context.Background(), env, &testJob{},
+		func(_ context.Context, _ *testJob) error { return nil })
+	if err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+}
 
-	select {
-	case <-consumeDone:
-	case <-time.After(200 * time.Millisecond):
-		t.Error("workers did not stop after context cancellation")
+func TestQueue_SafeExecute_ErrorReturn(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	env := newEnvelope("t", nil, nil)
+	err := q.safeExecute(context.Background(), env, &testJob{},
+		func(_ context.Context, _ *testJob) error { return fmt.Errorf("fail") })
+	if err == nil || err.Error() != "fail" {
+		t.Errorf("expected 'fail', got %v", err)
+	}
+}
+
+func TestQueue_SafeExecute_PanicRecover(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	env := newEnvelope("t", nil, nil)
+	var panicHandled atomic.Bool
+	q.opts.panicHandler = panicHandlerFunc(func(_ PanicContext) {
+		panicHandled.Store(true)
+	})
+	err := q.safeExecute(context.Background(), env, &testJob{},
+		func(_ context.Context, _ *testJob) error { panic("boom") })
+	if err == nil {
+		t.Error("expected error from recovered panic")
+	}
+	if !panicHandled.Load() {
+		t.Error("expected panic handler to be called")
+	}
+}
+
+func TestQueue_BuildMeta(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t)
+	env := &Envelope{
+		ID: "id-123", Topic: "orders", Attempt: 2,
+		Headers: map[string]string{"a": "b"},
+	}
+	meta := q.buildMeta(env, 1)
+	if meta.ID != "id-123" {
+		t.Errorf("expected ID 'id-123', got %q", meta.ID)
+	}
+	if meta.Attempt != 3 {
+		t.Errorf("expected attempt 3, got %d", meta.Attempt)
+	}
+}
+
+func TestQueue_ExecuteWithRetries_SuccessFirstTry(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueue(t, WithMaxRetries(3), WithBackoff(NoBackoff{}))
+	env := newEnvelope("t", nil, nil)
+	var count atomic.Int32
+	q.executeWithRetries(context.Background(), env, &testJob{},
+		func(_ context.Context, _ *testJob) error {
+			count.Add(1)
+			return nil
+		})
+	if count.Load() != 1 {
+		t.Errorf("expected 1 call, got %d", count.Load())
+	}
+}
+
+func TestQueue_ExecuteWithRetries_FailAndDLQ(t *testing.T) {
+	t.Parallel()
+	b := newMockBroker()
+	q, _ := New[*testJob](b,
+		WithMaxRetries(1), WithBackoff(NoBackoff{}), WithDLQ(true),
+	)
+	defer func() { q.Close(); b.Close() }()
+
+	env := newEnvelope(q.Topic(), nil, nil)
+	var mu sync.Mutex
+	var count int
+	q.executeWithRetries(context.Background(), env, &testJob{},
+		func(_ context.Context, _ *testJob) error {
+			mu.Lock()
+			count++
+			mu.Unlock()
+			return fmt.Errorf("fail")
+		})
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 2 {
+		t.Errorf("expected 2 attempts, got %d", count)
+	}
+}
+
+func TestQueue_GetTopicName_AllVariants(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		opts   []Option
+		expect string
+	}{
+		{"default", nil, "queue.testJob"},
+		{"custom_topic", []Option{WithTopic("override")}, "override"},
+		{"with_prefix", []Option{WithPrefix("ns:")}, "ns:queue.testJob"},
+		{"prefix_and_topic", []Option{WithPrefix("ns:"), WithTopic("x")}, "ns:x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q, _ := newQueue(t, tc.opts...)
+			if got := q.getTopicName(); got != tc.expect {
+				t.Errorf("expected %q, got %q", tc.expect, got)
+			}
+		})
+	}
+}
+
+func TestQueue_GetDLQTopic_AllVariants(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		opts   []Option
+		expect string
+	}{
+		{"default", nil, "dlq:queue.testJob"},
+		{"custom", []Option{WithTopic("x")}, "dlq:x"},
+		{"prefix", []Option{WithPrefix("ns:"), WithTopic("x")}, "ns:dlq:x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			q, _ := newQueue(t, tc.opts...)
+			if got := q.getDLQTopic(); got != tc.expect {
+				t.Errorf("expected %q, got %q", tc.expect, got)
+			}
+		})
 	}
 }

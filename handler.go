@@ -1,44 +1,47 @@
 package queue
 
-import (
-	"log/slog"
-)
+import "log/slog"
 
-type PanicHandler interface {
-	Handle(job any, consumer any, panicValue any, stack []byte)
+type ErrorContext struct {
+	Topic     string
+	MessageID string
+	Attempt   int
+	Err       error
+}
+
+type PanicContext struct {
+	Topic      string
+	MessageID  string
+	PanicValue any
+	Stack      []byte
 }
 
 type ErrorHandler interface {
-	Handle(job any, consumer any, err error)
+	Handle(ctx ErrorContext)
+}
+
+type PanicHandler interface {
+	Handle(ctx PanicContext)
 }
 
 type defaultPanicHandler struct{}
 
-func newDefaultPanicHandler() PanicHandler {
-	return &defaultPanicHandler{}
-}
-
-func (d *defaultPanicHandler) Handle(job any, consumer any, panicValue any, stack []byte) {
-	slog.Error(
-		"queue panic",
-		"job", job,
-		"consumer", consumer,
-		"panic", panicValue,
-		"stack", string(stack),
+func (d *defaultPanicHandler) Handle(ctx PanicContext) {
+	slog.Error("queue panic",
+		"topic", ctx.Topic,
+		"message_id", ctx.MessageID,
+		"panic", ctx.PanicValue,
+		"stack", string(ctx.Stack),
 	)
 }
 
 type defaultErrorHandler struct{}
 
-func newDefaultErrorHandler() ErrorHandler {
-	return &defaultErrorHandler{}
-}
-
-func (d *defaultErrorHandler) Handle(job any, consumer any, err error) {
-	slog.Error(
-		"queue error: job=%v, consumer=%v, error=%v",
-		"job", job,
-		"consumer", consumer,
-		"error", err,
+func (d *defaultErrorHandler) Handle(ctx ErrorContext) {
+	slog.Error("queue error",
+		"topic", ctx.Topic,
+		"message_id", ctx.MessageID,
+		"attempt", ctx.Attempt,
+		"error", ctx.Err,
 	)
 }

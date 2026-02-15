@@ -1,8 +1,6 @@
 package queue
 
-import (
-	"time"
-)
+import "time"
 
 type BackoffStrategy interface {
 	Delay(attempt int) time.Duration
@@ -12,7 +10,7 @@ type FixedBackoff struct {
 	Duration time.Duration
 }
 
-func (f FixedBackoff) Delay(attempt int) time.Duration {
+func (f FixedBackoff) Delay(_ int) time.Duration {
 	return f.Duration
 }
 
@@ -25,16 +23,22 @@ func (e ExponentialBackoff) Delay(attempt int) time.Duration {
 	if attempt < 0 {
 		return e.Base
 	}
-	if attempt > 62 {
+
+	const maxShift = 62
+	if attempt > maxShift {
 		return e.MaxDelay
 	}
+
 	delay := e.Base << uint(attempt)
 	if delay > e.MaxDelay || delay < e.Base {
 		return e.MaxDelay
 	}
+
 	return delay
 }
 
+// NoBackoff returns zero delay for all attempts.
 type NoBackoff struct{}
 
-func (NoBackoff) Delay(int) time.Duration { return 0 }
+// Delay always returns zero.
+func (NoBackoff) Delay(_ int) time.Duration { return 0 }

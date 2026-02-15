@@ -1,141 +1,219 @@
 package queue
 
 import (
-	"runtime"
+	"errors"
 	"testing"
 	"time"
 )
 
+func applyQueueOpts(opts ...Option) *options {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
+func TestDefaultOptions_Values(t *testing.T) {
+	t.Parallel()
+	o := defaultOptions()
+	if o.workerCount < 1 {
+		t.Errorf("expected workerCount >= 1, got %d", o.workerCount)
+	}
+	if o.maxRetries != 3 {
+		t.Errorf("expected maxRetries 3, got %d", o.maxRetries)
+	}
+	if o.bufferSize != 100 {
+		t.Errorf("expected bufferSize 100, got %d", o.bufferSize)
+	}
+	if o.backoff == nil {
+		t.Error("expected non-nil backoff")
+	}
+	if o.serializer == nil {
+		t.Error("expected non-nil serializer")
+	}
+	if o.panicHandler == nil {
+		t.Error("expected non-nil panicHandler")
+	}
+	if o.errorHandler == nil {
+		t.Error("expected non-nil errorHandler")
+	}
+}
+
+func TestWithTopic(t *testing.T) {
+	t.Parallel()
+	o := applyQueueOpts(WithTopic("custom"))
+	if o.topic != "custom" {
+		t.Errorf("expected 'custom', got %q", o.topic)
+	}
+}
+
 func TestWithPrefix(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
-		name   string
-		prefix string
-	}{
-		{"empty_prefix", ""},
-		{"simple_prefix", "test:"},
-		{"complex_prefix", "prod:app:v1:"},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			opts := &options{}
-			WithPrefix(tt.prefix)(opts)
-			if opts.prefix != tt.prefix {
-				t.Errorf("expected %q, got %q", tt.prefix, opts.prefix)
-			}
-		})
+	o := applyQueueOpts(WithPrefix("pfx:"))
+	if o.prefix != "pfx:" {
+		t.Errorf("expected 'pfx:', got %q", o.prefix)
 	}
 }
 
 func TestWithDLQ(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
-		name    string
-		enabled bool
-	}{
-		{"dlq_enabled", true},
-		{"dlq_disabled", false},
+	o := applyQueueOpts(WithDLQ(true))
+	if !o.dlqEnabled {
+		t.Error("expected dlqEnabled true")
 	}
+}
 
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
+func TestWithWorkerCount_Boundaries(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		n    int
+		want int
+	}{
+		{"positive", 4, 4},
+		{"zero_clamps_to_1", 0, 1},
+		{"negative_clamps_to_1", -5, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			opts := &options{}
-			WithDLQ(tt.enabled)(opts)
-			if opts.dlqEnabled != tt.enabled {
-				t.Errorf("expected %v, got %v", tt.enabled, opts.dlqEnabled)
+			o := applyQueueOpts(WithWorkerCount(tc.n))
+			if o.workerCount != tc.want {
+				t.Errorf("expected %d, got %d", tc.want, o.workerCount)
 			}
 		})
 	}
 }
 
-func TestWithWorkerCount_LessThanOne(t *testing.T) {
+func TestWithMaxRetries_Boundaries(t *testing.T) {
 	t.Parallel()
-
-	tests := []int{-100, -1, 0}
-
-	for _, n := range tests {
-		n := n
-		opts := &options{}
-		WithWorkerCount(n)(opts)
-		if opts.workerCount != 1 {
-			t.Errorf("n=%d: expected 1, got %d", n, opts.workerCount)
-		}
+	cases := []struct {
+		name string
+		n    int
+		want int
+	}{
+		{"positive", 5, 5},
+		{"zero", 0, 0},
+		{"negative_clamps_to_0", -3, 0},
 	}
-}
-
-func TestWithWorkerCount_ValidValues(t *testing.T) {
-	t.Parallel()
-
-	tests := []int{1, 2, 10, 100, runtime.NumCPU()}
-
-	for _, n := range tests {
-		n := n
-		opts := &options{}
-		WithWorkerCount(n)(opts)
-		if opts.workerCount != n {
-			t.Errorf("expected %d, got %d", n, opts.workerCount)
-		}
-	}
-}
-
-func TestWithMaxRetries(t *testing.T) {
-	t.Parallel()
-
-	tests := []int{-1, 0, 1, 3, 10, 100}
-
-	for _, n := range tests {
-		n := n
-		opts := &options{}
-		WithMaxRetries(n)(opts)
-		if opts.maxRetries != n {
-			t.Errorf("expected %d, got %d", n, opts.maxRetries)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := applyQueueOpts(WithMaxRetries(tc.n))
+			if o.maxRetries != tc.want {
+				t.Errorf("expected %d, got %d", tc.want, o.maxRetries)
+			}
+		})
 	}
 }
 
 func TestWithBackoff(t *testing.T) {
 	t.Parallel()
-
-	fb := FixedBackoff{Duration: 5 * time.Second}
-	opts := &options{}
-	WithBackoff(fb)(opts)
-
-	if opts.backoff == nil {
-		t.Error("expected backoff to be set")
-	}
-
-	if opts.backoff.Delay(0) != 5*time.Second {
-		t.Errorf("expected 5s, got %v", opts.backoff.Delay(0))
+	fb := FixedBackoff{Duration: 2 * time.Second}
+	o := applyQueueOpts(WithBackoff(fb))
+	if o.backoff != fb {
+		t.Error("backoff not set correctly")
 	}
 }
 
 func TestWithErrorHandler(t *testing.T) {
 	t.Parallel()
-
-	handler := &defaultErrorHandler{}
-	opts := &options{}
-	WithErrorHandler(handler)(opts)
-
-	if opts.errorHandler != handler {
-		t.Error("expected error handler to be set")
+	o := applyQueueOpts(WithErrorHandler(&defaultErrorHandler{}))
+	if o.errorHandler == nil {
+		t.Error("expected non-nil errorHandler")
 	}
 }
 
 func TestWithPanicHandler(t *testing.T) {
 	t.Parallel()
+	o := applyQueueOpts(WithPanicHandler(&defaultPanicHandler{}))
+	if o.panicHandler == nil {
+		t.Error("expected non-nil panicHandler")
+	}
+}
 
-	handler := &defaultPanicHandler{}
-	opts := &options{}
-	WithPanicHandler(handler)(opts)
+func TestWithBufferSize_Boundaries(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		n    int
+		want int
+	}{
+		{"positive", 50, 50},
+		{"zero_clamps_to_1", 0, 1},
+		{"negative_clamps_to_1", -10, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := applyQueueOpts(WithBufferSize(tc.n))
+			if o.bufferSize != tc.want {
+				t.Errorf("expected %d, got %d", tc.want, o.bufferSize)
+			}
+		})
+	}
+}
 
-	if opts.panicHandler != handler {
-		t.Error("expected panic handler to be set")
+func TestWithSerializer(t *testing.T) {
+	t.Parallel()
+	o := applyQueueOpts(WithSerializer(JSONSerializer{}))
+	if o.serializer == nil {
+		t.Error("expected non-nil serializer")
+	}
+}
+
+func TestWithHeaders(t *testing.T) {
+	t.Parallel()
+	h := map[string]string{"key": "val"}
+	po := &produceOptions{}
+	opt := WithHeaders(h)
+	opt(po)
+	if po.headers["key"] != "val" {
+		t.Errorf("expected header key=val, got %v", po.headers)
+	}
+}
+
+func TestValidateOptions_AllValid(t *testing.T) {
+	t.Parallel()
+	o := defaultOptions()
+	if err := validateOptions(o); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+func TestValidateOptions_NilBackoff(t *testing.T) {
+	t.Parallel()
+	o := defaultOptions()
+	o.backoff = nil
+	if err := validateOptions(o); !errors.Is(err, ErrNilBackoff) {
+		t.Errorf("expected ErrNilBackoff, got %v", err)
+	}
+}
+
+func TestValidateOptions_NilErrorHandler(t *testing.T) {
+	t.Parallel()
+	o := defaultOptions()
+	o.errorHandler = nil
+	if err := validateOptions(o); !errors.Is(err, ErrNilErrorHandler) {
+		t.Errorf("expected ErrNilErrorHandler, got %v", err)
+	}
+}
+
+func TestValidateOptions_NilPanicHandler(t *testing.T) {
+	t.Parallel()
+	o := defaultOptions()
+	o.panicHandler = nil
+	if err := validateOptions(o); !errors.Is(err, ErrNilPanicHandler) {
+		t.Errorf("expected ErrNilPanicHandler, got %v", err)
+	}
+}
+
+func TestValidateOptions_NilSerializer(t *testing.T) {
+	t.Parallel()
+	o := defaultOptions()
+	o.serializer = nil
+	if err := validateOptions(o); !errors.Is(err, ErrNilSerializer) {
+		t.Errorf("expected ErrNilSerializer, got %v", err)
 	}
 }

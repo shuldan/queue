@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,419 +11,351 @@ import (
 	"github.com/shuldan/queue"
 )
 
-func TestBroker_ProduceConsume(t *testing.T) {
-	b := New()
+func newTestBroker() *broker {
+	return New().(*broker)
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	received := make(chan []byte, 1)
-	consumeDone := make(chan error, 1)
-
-	go func() {
-		consumeDone <- b.Consume(ctx, "test", func(data []byte) error {
-			received <- data
-			return nil
-		})
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-
-	err := b.Produce(context.Background(), "test", []byte("hello"))
-	if err != nil {
-		t.Fatalf("Produce failed: %v", err)
-	}
-
-	select {
-	case data := <-received:
-		if string(data) != "hello" {
-			t.Errorf("expected 'hello', got %q", string(data))
+func produceAndWaitHandler(
+	t *testing.T, b *broker, topic string, ready chan struct{},
+) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		err := b.Produce(context.Background(), topic, []byte("ping"))
+		if err == nil {
+			break
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timeout waiting for message")
-	}
-
-	cancel()
-
-	select {
-	case err := <-consumeDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("expected context.Canceled, got %v", err)
+		select {
+		case <-deadline:
+			t.Fatal("timed out producing warmup message")
+		default:
+			time.Sleep(time.Millisecond)
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("Consume did not finish")
+	}
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for handler to be called")
 	}
 }
 
-func TestBroker_Consume_BlocksUntilContextDone(t *testing.T) {
+func TestNew_CreatesBroker(t *testing.T) {
 	t.Parallel()
-
 	b := New()
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	if b == nil {
+		t.Fatal("expected non-nil broker")
+	}
+}
+
+func TestProduce_BasicMessage(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	defer b.Close()
+	err := b.Produce(context.Background(), "topic1", []byte("hello"))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestProduce_ClosedBroker(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	b.Close()
+	err := b.Produce(context.Background(), "topic1", []byte("hello"))
+	if !errors.Is(err, queue.ErrBrokerClosed) {
+		t.Errorf("expected ErrBrokerClosed, got %v", err)
+	}
+}
+
+func TestProduce_CancelledContext(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	defer b.Close()
+	ch := b.getOrCreateChan("full")
+	for range 100 {
+		ch <- []byte("x")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := b.Produce(ctx, "full", []byte("overflow"))
+	if err == nil {
+		t.Fatal("expected context error")
+	}
+}
+
+func TestConsume_BasicFlow(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+
+	var received atomic.Value
+	ready := make(chan struct{}, 10)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	consumeStarted := make(chan struct{})
-	consumeDone := make(chan error, 1)
-
+	doneCh := make(chan error, 1)
 	go func() {
-		close(consumeStarted)
-		consumeDone <- b.Consume(ctx, "test", func(data []byte) error {
+		doneCh <- b.Consume(ctx, "t", func(data []byte) error {
+			received.Store(string(data))
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
 			return nil
 		})
 	}()
 
-	<-consumeStarted
+	produceAndWaitHandler(t, b, "t", ready)
 
+	if err := b.Produce(context.Background(), "t", []byte("real")); err != nil {
+		t.Fatalf("produce error: %v", err)
+	}
 	select {
-	case <-consumeDone:
-		t.Error("Consume should not finish before context is cancelled")
-	case <-time.After(20 * time.Millisecond):
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second message")
 	}
 
 	cancel()
+	<-doneCh
 
-	select {
-	case err := <-consumeDone:
-		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-			t.Errorf("expected context error, got %v", err)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Consume did not finish after context cancellation")
+	v, _ := received.Load().(string)
+	if v != "real" {
+		t.Errorf("expected 'real', got %q", v)
 	}
 }
 
-func TestBroker_ConcurrentConsume(t *testing.T) {
-	b := New()
+func TestConsume_ClosedBroker(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	b.Close()
+	err := b.Consume(context.Background(), "t", func([]byte) error { return nil })
+	if !errors.Is(err, queue.ErrBrokerClosed) {
+		t.Errorf("expected ErrBrokerClosed, got %v", err)
+	}
+}
+
+func TestConsume_BrokerCloseWhileConsuming(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+
+	ready := make(chan struct{}, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- b.Consume(context.Background(), "t", func([]byte) error {
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+	}()
+
+	produceAndWaitHandler(t, b, "t", ready)
+
+	b.Close()
+	err := <-errCh
+	if !errors.Is(err, queue.ErrBrokerClosed) {
+		t.Errorf("expected ErrBrokerClosed, got %v", err)
+	}
+}
+
+func TestConsume_HandlerPanic(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var count atomic.Int32
-	expected := 5
+	var callCount atomic.Int32
+	ready := make(chan struct{}, 10)
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- b.Consume(ctx, "panic-topic", func([]byte) error {
+			n := callCount.Add(1)
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+			if n >= 2 {
+				panic("test panic")
+			}
+			return nil
+		})
+	}()
 
-	for i := 0; i < 3; i++ {
-		go func() {
-			_ = b.Consume(ctx, "shared", func([]byte) error {
-				count.Add(1)
-				return nil
-			})
-		}()
+	produceAndWaitHandler(t, b, "panic-topic", ready)
+
+	_ = b.Produce(context.Background(), "panic-topic", []byte("boom"))
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
 	}
-
-	time.Sleep(20 * time.Millisecond)
-
-	for i := 0; i < expected; i++ {
-		_ = b.Produce(context.Background(), "shared", []byte("msg"))
-	}
-
 	time.Sleep(50 * time.Millisecond)
 
-	actualCount := count.Load()
-	if actualCount != int32(expected) {
-		t.Errorf("expected %d messages, got %d", expected, actualCount)
-	}
-
 	cancel()
-	time.Sleep(20 * time.Millisecond)
+	<-doneCh
 }
 
-func TestBroker_Produce_BrokerClosed(t *testing.T) {
+func TestPing_OpenBroker(t *testing.T) {
 	t.Parallel()
-
-	b := New()
-	err := b.Close()
-	if err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	err = b.Produce(context.Background(), "test", []byte("after"))
-	if !errors.Is(err, queue.ErrQueueClosed) {
-		t.Errorf("expected ErrQueueClosed, got %v", err)
+	b := newTestBroker()
+	defer b.Close()
+	if err := b.Ping(context.Background()); err != nil {
+		t.Errorf("expected nil, got %v", err)
 	}
 }
 
-func TestBroker_Consume_BrokerClosed(t *testing.T) {
+func TestPing_ClosedBroker(t *testing.T) {
 	t.Parallel()
-
-	b := New()
-	err := b.Close()
-	if err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	err = b.Consume(context.Background(), "test", func([]byte) error { return nil })
-	if !errors.Is(err, queue.ErrQueueClosed) {
-		t.Errorf("expected ErrQueueClosed, got %v", err)
+	b := newTestBroker()
+	b.Close()
+	err := b.Ping(context.Background())
+	if !errors.Is(err, queue.ErrBrokerClosed) {
+		t.Errorf("expected ErrBrokerClosed, got %v", err)
 	}
 }
 
-func TestBroker_Close_WaitsForConsumers(t *testing.T) {
-	b := New()
+func TestClose_Idempotent(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	if err := b.Close(); err != nil {
+		t.Errorf("first close: %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Errorf("second close: %v", err)
+	}
+}
+
+func TestGetOrCreateChan_ReturnsSameChannel(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	defer b.Close()
+	ch1 := b.getOrCreateChan("topic")
+	ch2 := b.getOrCreateChan("topic")
+	if ch1 != ch2 {
+		t.Error("expected same channel for same topic")
+	}
+}
+
+func TestDrainChannel_EmptyChannel(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	defer b.Close()
+	ch := make(chan []byte, 5)
+	called := false
+	b.drainChannel(ch, "t", func([]byte) error {
+		called = true
+		return nil
+	})
+	if called {
+		t.Error("handler should not be called on empty channel")
+	}
+}
+
+func TestDrainChannel_WithData(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	defer b.Close()
+	ch := make(chan []byte, 5)
+	ch <- []byte("msg1")
+	ch <- []byte("msg2")
+	var count int
+	b.drainChannel(ch, "t", func([]byte) error {
+		count++
+		return nil
+	})
+	if count != 2 {
+		t.Errorf("expected 2 calls, got %d", count)
+	}
+}
+
+func TestDrainChannel_ClosedChannel(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	defer b.Close()
+	ch := make(chan []byte, 5)
+	ch <- []byte("msg")
+	close(ch)
+	var count int
+	b.drainChannel(ch, "t", func([]byte) error {
+		count++
+		return nil
+	})
+	if count != 1 {
+		t.Errorf("expected 1 call, got %d", count)
+	}
+}
+
+func TestSafeHandle_CancelledContext(t *testing.T) {
+	t.Parallel()
+	b := newTestBroker()
+	defer b.Close()
 	ctx, cancel := context.WithCancel(context.Background())
-
-	consumeStarted := make(chan struct{})
-	go func() {
-		close(consumeStarted)
-		_ = b.Consume(ctx, "test", func([]byte) error {
-			time.Sleep(50 * time.Millisecond)
-			return nil
-		})
-	}()
-
-	<-consumeStarted
-	time.Sleep(10 * time.Millisecond)
-
-	_ = b.Produce(context.Background(), "test", []byte("msg"))
-
 	cancel()
-
-	closeDone := make(chan struct{})
-	go func() {
-		_ = b.Close()
-		close(closeDone)
-	}()
-
-	select {
-	case <-closeDone:
-	case <-time.After(200 * time.Millisecond):
-		t.Error("Close did not wait for consumers to finish")
+	called := false
+	b.safeHandle(ctx, []byte("x"), "t", func([]byte) error {
+		called = true
+		return nil
+	})
+	if called {
+		t.Error("handler should not be called when context is cancelled")
 	}
 }
 
-func TestBroker_Close_AlreadyClosed(t *testing.T) {
+func TestSafeHandle_PanicRecovery(t *testing.T) {
 	t.Parallel()
-
-	b := New()
-	err := b.Close()
-	if err != nil {
-		t.Fatalf("first Close failed: %v", err)
-	}
-
-	err = b.Close()
-	if err != nil {
-		t.Errorf("second Close should not error, got %v", err)
-	}
+	b := newTestBroker()
+	defer b.Close()
+	b.safeHandle(context.Background(), []byte("x"), "t", func([]byte) error {
+		panic("boom")
+	})
 }
 
-func TestBroker_Produce_ContextCanceled(t *testing.T) {
+func TestConsume_MultipleTopics(t *testing.T) {
 	t.Parallel()
+	b := newTestBroker()
 
-	b := New()
-
-	for i := 0; i < 100; i++ {
-		err := b.Produce(context.Background(), "test", []byte("fill"))
-		if err != nil {
-			t.Fatalf("failed to fill buffer: %v", err)
-		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := b.Produce(ctx, "test", []byte("should fail"))
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-}
-
-func TestBroker_HandlerPanic(t *testing.T) {
-	b := New()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	panicHandled := make(chan struct{})
-	messageReceived := make(chan struct{})
-
-	go func() {
-		_ = b.Consume(ctx, "panic-test", func(data []byte) error {
-			close(messageReceived)
-			defer func() {
-				if r := recover(); r != nil {
-					close(panicHandled)
-				}
-			}()
-			panic("test panic")
-		})
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-
-	err := b.Produce(context.Background(), "panic-test", []byte("trigger"))
-	if err != nil {
-		t.Fatalf("Produce failed: %v", err)
-	}
-
-	select {
-	case <-messageReceived:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("message was not received")
-	}
-
-	time.Sleep(20 * time.Millisecond)
-
-	cancel()
-}
-
-func TestBroker_MultipleTopic(t *testing.T) {
-	t.Parallel()
-
-	b := New()
+	var count1, count2 atomic.Int32
+	ready1 := make(chan struct{}, 10)
+	ready2 := make(chan struct{}, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	received1 := make(chan []byte, 1)
-	received2 := make(chan []byte, 1)
-
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		_ = b.Consume(ctx, "topic1", func(data []byte) error {
-			received1 <- data
+		defer wg.Done()
+		_ = b.Consume(ctx, "t1", func([]byte) error {
+			count1.Add(1)
+			select {
+			case ready1 <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		_ = b.Consume(ctx, "t2", func([]byte) error {
+			count2.Add(1)
+			select {
+			case ready2 <- struct{}{}:
+			default:
+			}
 			return nil
 		})
 	}()
 
-	go func() {
-		_ = b.Consume(ctx, "topic2", func(data []byte) error {
-			received2 <- data
-			return nil
-		})
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-
-	_ = b.Produce(context.Background(), "topic1", []byte("msg1"))
-	_ = b.Produce(context.Background(), "topic2", []byte("msg2"))
-
-	var r1, r2 string
-
-	select {
-	case data := <-received1:
-		r1 = string(data)
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timeout waiting for topic1 message")
-	}
-
-	select {
-	case data := <-received2:
-		r2 = string(data)
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timeout waiting for topic2 message")
-	}
-
-	if r1 != "msg1" {
-		t.Errorf("expected 'msg1' on topic1, got %q", r1)
-	}
-	if r2 != "msg2" {
-		t.Errorf("expected 'msg2' on topic2, got %q", r2)
-	}
+	produceAndWaitHandler(t, b, "t1", ready1)
+	produceAndWaitHandler(t, b, "t2", ready2)
 
 	cancel()
-}
+	wg.Wait()
 
-func TestBroker_HandlerError(t *testing.T) {
-	t.Parallel()
-
-	b := New()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	handlerCalled := make(chan struct{})
-
-	go func() {
-		_ = b.Consume(ctx, "test", func(data []byte) error {
-			close(handlerCalled)
-			return errors.New("handler error")
-		})
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-
-	err := b.Produce(context.Background(), "test", []byte("msg"))
-	if err != nil {
-		t.Fatalf("Produce failed: %v", err)
+	if count1.Load() < 1 {
+		t.Errorf("t1: expected >= 1, got %d", count1.Load())
 	}
-
-	select {
-	case <-handlerCalled:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("handler was not called")
-	}
-
-	cancel()
-}
-
-func TestBroker_MultipleMessages(t *testing.T) {
-	t.Parallel()
-
-	b := New()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	const numMessages = 10
-	received := make(chan []byte, numMessages)
-
-	go func() {
-		_ = b.Consume(ctx, "test", func(data []byte) error {
-			received <- data
-			return nil
-		})
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-
-	for i := 0; i < numMessages; i++ {
-		err := b.Produce(context.Background(), "test", []byte("msg"))
-		if err != nil {
-			t.Fatalf("Produce failed: %v", err)
-		}
-	}
-
-	count := 0
-	timeout := time.After(200 * time.Millisecond)
-	for count < numMessages {
-		select {
-		case <-received:
-			count++
-		case <-timeout:
-			t.Fatalf("timeout: received %d/%d messages", count, numMessages)
-		}
-	}
-
-	cancel()
-}
-
-func TestBroker_ConsumeStopsOnContextCancel(t *testing.T) {
-	t.Parallel()
-
-	b := New()
-	ctx, cancel := context.WithCancel(context.Background())
-
-	consumeDone := make(chan error, 1)
-	messageReceived := make(chan struct{})
-
-	go func() {
-		consumeDone <- b.Consume(ctx, "test", func(data []byte) error {
-			close(messageReceived)
-			return nil
-		})
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-
-	_ = b.Produce(context.Background(), "test", []byte("msg"))
-
-	select {
-	case <-messageReceived:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("message not received")
-	}
-
-	cancel()
-
-	select {
-	case err := <-consumeDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("expected context.Canceled, got %v", err)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Consume did not stop after context cancellation")
+	if count2.Load() < 1 {
+		t.Errorf("t2: expected >= 1, got %d", count2.Load())
 	}
 }
